@@ -105,7 +105,14 @@ app.add_middleware(
 )
 
 Base = declarative_base()
-engine = create_engine("sqlite:///./complaints.db", echo=False, future=True)
+
+# ✅ Allow SQLite access across FastAPI threads
+engine = create_engine(
+    "sqlite:///./complaints.db",
+    echo=False,
+    future=True,
+    connect_args={"check_same_thread": False},
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # ------------------------------
@@ -147,7 +154,7 @@ class Complaint(Base):
     student: Mapped["Student"] = relationship("Student", back_populates="complaints")
 
     __table_args__ = (
-        # ✅ Updated to match frontend values
+        # ✅ Matches frontend values
         CheckConstraint("status in ('pending','in_progress','resolved')", name="ck_status"),
     )
 
@@ -185,7 +192,6 @@ class ComplaintOut(BaseModel):
 class ComplaintOutWithStudent(ComplaintOut):
     student_id: int
 
-# ✅ Updated to match frontend values
 class StatusUpdate(BaseModel):
     status: str = Field(pattern=r"^(pending|in_progress|resolved)$")
 
@@ -398,6 +404,7 @@ def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: 
     if not stu:
         raise HTTPException(status_code=404, detail="Student not found")
 
+    # ✅ Insert directly into SQLite (local file complaints.db)
     comp = Complaint(
         student_id=payload.student_id,
         heading=payload.heading.strip(),
@@ -407,10 +414,10 @@ def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: 
         status="pending",
     )
     db.add(comp)
-    db.commit()
-    db.refresh(comp)
+    db.commit()        # ensure row is written
+    db.refresh(comp)   # load auto fields like id, created_at
 
-    # Agentic classification
+    # Agentic classification (updates the same DB row)
     text = f"{comp.heading}\n\n{comp.description}"
     decision = simple_keyword_classifier(text)
     if decision is None:
@@ -418,8 +425,9 @@ def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: 
 
     if decision is True:
         comp.is_ragging_related = True
+        comp.forwarded_to_arc = True     # ✅ reflect immediate forwarding intent in DB
         db.commit()
-        # Send ARC email in background
+        # Send ARC email in background (non-blocking)
         background.add_task(send_ragging_email, comp)
 
     return ComplaintOut(
