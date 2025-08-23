@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import os
 import smtplib
+import logging
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -70,6 +71,15 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, relationship, Session, sessionmaker, Mapped, mapped_column
 
 # ------------------------------
+# Logging (visible on your host logs, e.g. Railway)
+# ------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("complaints")
+
+# ------------------------------
 # Environment & Config
 # ------------------------------
 load_dotenv()
@@ -83,36 +93,26 @@ FROM_EMAIL = os.getenv("FROM_EMAIL")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+    log.info("Gemini configured: key present")
+else:
+    log.info("Gemini not configured: GEMINI_API_KEY missing")
 
 # ------------------------------
 # App / DB Setup
 # ------------------------------
 app = FastAPI(title="Agentic Campus Complaint Portal")
 
-# ✅ Updated CORS configuration to include deployed domain and allow all origins for development
-ALLOWED_ORIGINS = [
-    "http://localhost:8080",
-    "http://127.0.0.1:8080",
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:5173",
-    "https://web-production-89a82.up.railway.app",
-    # Add your deployed frontend domain here
-    "*"  # Allow all origins for development - remove in production
-]
-
+# CORS: permissive for dev
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["*"],  # Allow all headers
+    allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
 
-# ✅ Catch-all OPTIONS so proxies don't 405 the preflight
 @app.options("/{rest_of_path:path}")
 def cors_preflight(rest_of_path: str):
     return Response(
@@ -127,7 +127,7 @@ def cors_preflight(rest_of_path: str):
 
 Base = declarative_base()
 
-# ✅ Allow SQLite access across FastAPI threads
+# SQLite connection for multi-threaded FastAPI
 engine = create_engine(
     "sqlite:///./complaints.db",
     echo=False,
@@ -175,10 +175,8 @@ class Complaint(Base):
     student: Mapped["Student"] = relationship("Student", back_populates="complaints")
 
     __table_args__ = (
-        # ✅ Matches frontend values (may not be physically present after migration; enforced at app level too)
         CheckConstraint("status in ('pending','in_progress','resolved')", name="ck_status"),
     )
-
 
 # ------------------------------
 # Pydantic Schemas
@@ -223,7 +221,6 @@ class DashboardStats(BaseModel):
     public_feed: List[ComplaintOut]
 
 class ReportRequest(BaseModel):
-    # Reserved for future parameters
     pass
 
 class ReportResponse(BaseModel):
@@ -247,8 +244,8 @@ ADMIN_CREDENTIALS = [
 RAGGING_KEYWORDS = {
     "ragging", "hazing", "harass", "harassment", "bully", "bullying",
     "assault", "threat", "extort", "freshers", "seniors forced",
-    "force introduction", "forced introduction", "rag", "ragged",
-    "physical abuse", "verbal abuse", "intimidate", "coerce",
+    "force introduction", "forced introduction", "physical abuse",
+    "verbal abuse", "intimidate", "coerce", "rag", "ragged"
 }
 
 def get_db():
@@ -258,9 +255,7 @@ def get_db():
     finally:
         db.close()
 
-
 def _needs_status_migration(conn) -> bool:
-    # Check table SQL for old enum words or presence of 'done'/'not started'
     cur = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='complaints'")
     row = cur.fetchone()
     if not row or not row[0]:
@@ -268,9 +263,7 @@ def _needs_status_migration(conn) -> bool:
     ddl = row[0].lower()
     return ("not started" in ddl) or ("done" in ddl)
 
-
 def _migrate_complaints_table(conn) -> None:
-    # Recreate complaints table without old CHECK, and normalize existing rows
     conn.executescript("""
     PRAGMA foreign_keys=off;
     BEGIN TRANSACTION;
@@ -314,20 +307,16 @@ def _migrate_complaints_table(conn) -> None:
     PRAGMA foreign_keys=on;
     """)
 
-
 def ensure_seed_data(db: Session) -> None:
-    # Create tables
     Base.metadata.create_all(bind=engine)
-
-    # --- Migration: fix legacy status constraint/values if present ---
     with engine.begin() as conn:
         try:
             if _needs_status_migration(conn.connection):
+                log.info("Running complaints table migration (status normalization)")
                 _migrate_complaints_table(conn.connection)
         except Exception as e:
-            print("[Migration] Skipped status migration due to error:", e)
+            log.error("Migration skipped due to error: %s", e)
 
-    # Seed if empty
     if not db.scalar(select(func.count(Student.id))):
         for s in STUDENT_CREDENTIALS:
             db.add(Student(id=s["id"], name=s["name"], email=s["email"], password=s["password"]))
@@ -336,43 +325,37 @@ def ensure_seed_data(db: Session) -> None:
             db.add(Admin(id=a["id"], name=a["name"], email=a["email"], password=a["password"]))
 
     if not db.scalar(select(func.count(Complaint.id))):
-        # Some dummy complaints
         samples = [
             Complaint(student_id=1, heading="Water leakage in hostel", description="Bathroom on 2nd floor leaks.", anonymous=False, public=True, status="resolved"),
             Complaint(student_id=2, heading="WiFi not working", description="Library WiFi down since yesterday.", anonymous=False, public=True, status="pending"),
             Complaint(student_id=1, heading="Seniors forcing introductions", description="Freshers asked to give intro loudly.", anonymous=True, public=False, status="pending"),
         ]
         db.add_all(samples)
-
     db.commit()
-
 
 @app.on_event("startup")
 def startup_event():
     with SessionLocal() as db:
         ensure_seed_data(db)
-
+    log.info("Startup complete. SMTP_HOST=%s, ANTI_RAGGING_EMAIL=%s, FROM_EMAIL=%s",
+             SMTP_HOST, ANTI_RAGGING_EMAIL, FROM_EMAIL)
 
 # ------------------------------
-# Agentic Classifier & Email
+# Classifier & Email
 # ------------------------------
 def simple_keyword_classifier(text: str) -> Optional[bool]:
-    """
-    Returns:
-      True  -> clearly ragging-related
-      None  -> uncertain
-    """
     if not text:
         return None
     lower = text.lower()
-    # high-confidence: any keyword hit -> True
-    if any(kw in lower for kw in RAGGING_KEYWORDS):
+    hit = any(kw in lower for kw in RAGGING_KEYWORDS)
+    log.info("[Classifier] keyword=%s", hit)
+    if hit:
         return True
-    return None  # uncertain
-
+    return None
 
 def gemini_is_ragging(text: str) -> Optional[bool]:
     if not GEMINI_API_KEY:
+        log.info("[Classifier] Gemini not configured; skip")
         return None
     try:
         model = genai.GenerativeModel("gemini-1.5-flash")
@@ -384,20 +367,21 @@ def gemini_is_ragging(text: str) -> Optional[bool]:
         )
         resp = model.generate_content(prompt)
         content = (resp.text or "").strip().upper()
+        decision = None
         if "YES" in content and "NO" not in content:
-            return True
-        if "NO" in content and "YES" not in content:
-            return False
+            decision = True
+        elif "NO" in content and "YES" not in content:
+            decision = False
+        log.info("[Classifier] Gemini decision=%s (raw=%s)", decision, content)
+        return decision
     except Exception as e:
-        print("Gemini classification error:", e)
+        log.error("Gemini classification error: %s", e)
     return None
-
 
 def _ensure_outbox_dir() -> str:
     out_dir = os.path.join(os.getcwd(), "outbox")
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
-
 
 def _save_eml_copy(filename_base: str, msg: MIMEMultipart) -> None:
     out_dir = _ensure_outbox_dir()
@@ -405,19 +389,11 @@ def _save_eml_copy(filename_base: str, msg: MIMEMultipart) -> None:
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(msg.as_string())
-        print(f"[OUTBOX] Saved email copy to {path}")
+        log.info("[OUTBOX] Saved email copy to %s", path)
     except Exception as e:
-        print("[OUTBOX] Failed to save .eml copy:", e)
-
+        log.error("[OUTBOX] Failed to save .eml copy: %s", e)
 
 def send_ragging_email(complaint: Complaint):
-    """
-    Attempts to send an email to the Anti-Ragging Cell with SMTP.
-    - Uses STARTTLS for ports like 587.
-    - Uses SSL for port 465.
-    - Falls back to unauthenticated SMTP if creds missing (for campus relays).
-    - Always writes a copy to ./outbox/*.eml for audit/dev.
-    """
     subject = f"[ARC FLAG] Complaint #{complaint.id}: {complaint.heading}"
     body = (
         f"Complaint ID: {complaint.id}\n"
@@ -438,40 +414,34 @@ def send_ragging_email(complaint: Complaint):
     msg["X-Auto-Generated"] = "Yes"
     msg.attach(MIMEText(body, "plain"))
 
-    # Always save a copy to outbox (so a "mail is written" even if SMTP fails/missing)
     _save_eml_copy(f"arc-{complaint.id}", msg)
 
-    # If SMTP host not defined, skip network send (already saved .eml)
     if not SMTP_HOST:
-        print("[SMTP] SMTP_HOST missing; saved .eml only.")
+        log.warning("[SMTP] SMTP_HOST missing; wrote .eml only (no network send)")
         return
 
     try:
         if SMTP_PORT == 465:
-            # SSL direct
             with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
                 server.ehlo()
                 if SMTP_USER and SMTP_PASS:
                     server.login(SMTP_USER, SMTP_PASS)
                 server.send_message(msg)
         else:
-            # STARTTLS or plain
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
                 server.ehlo()
                 try:
                     server.starttls()
                     server.ehlo()
-                except Exception:
-                    # Some campus relays may not support STARTTLS; proceed without it
-                    pass
+                except Exception as e:
+                    log.warning("[SMTP] STARTTLS not available/failed: %s (sending without TLS)", e)
                 if SMTP_USER and SMTP_PASS:
                     server.login(SMTP_USER, SMTP_PASS)
                 server.send_message(msg)
-        print(f"[SMTP] Sent ARC email for complaint {complaint.id}")
+        log.info("[SMTP] Sent ARC email for complaint %s", complaint.id)
     except Exception as e:
-        print("[SMTP] Error sending ARC email:", e)
-        # .eml copy already saved; nothing else to do
-
+        log.error("[SMTP] Error sending ARC email: %s", e)
+        # .eml already saved
 
 # ------------------------------
 # Endpoint Implementations
@@ -480,18 +450,15 @@ def send_ragging_email(complaint: Complaint):
 # Auth
 @app.post("/login/student", response_model=LoginResponse)
 def login_student(payload: LoginRequest, db: Session = Depends(get_db)):
-    # Hardcoded auth
     s = next((x for x in STUDENT_CREDENTIALS if x["email"] == payload.email and x["password"] == payload.password), None)
     if not s:
         raise HTTPException(status_code=401, detail="Invalid student credentials")
-    # Ensure presence in DB
     stu = db.scalar(select(Student).where(Student.email == s["email"]))
     if not stu:
         stu = Student(id=s["id"], name=s["name"], email=s["email"], password=s["password"])
         db.add(stu)
         db.commit()
     return LoginResponse(role="student", id=s["id"], name=s["name"]) 
-
 
 @app.post("/login/admin", response_model=LoginResponse)
 def login_admin(payload: LoginRequest, db: Session = Depends(get_db)):
@@ -505,48 +472,35 @@ def login_admin(payload: LoginRequest, db: Session = Depends(get_db)):
         db.commit()
     return LoginResponse(role="admin", id=a["id"], name=a["name"]) 
 
-
 # Student Dashboard
 @app.get("/student/dashboard/{student_id}", response_model=DashboardStats)
 def student_dashboard(student_id: int, db: Session = Depends(get_db)):
-    # Stats for *all* complaints visible to student
     total = db.scalar(select(func.count(Complaint.id))) or 0
     resolved = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "resolved")) or 0
     pending = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "pending")) or 0
 
-    # Recent public complaints (anonymized)
     public_q = select(Complaint).where(Complaint.public == True).order_by(Complaint.created_at.desc()).limit(10)
     public_items = db.scalars(public_q).all()
 
     def to_out(c: Complaint) -> ComplaintOut:
         return ComplaintOut(
-            id=c.id,
-            heading=c.heading,
-            description=c.description,
-            anonymous=True,  # force anonymity on public feed
-            public=c.public,
-            status=c.status,
-            created_at=c.created_at,
-            is_ragging_related=c.is_ragging_related,
+            id=c.id, heading=c.heading, description=c.description,
+            anonymous=True, public=c.public, status=c.status,
+            created_at=c.created_at, is_ragging_related=c.is_ragging_related,
         )
 
     return DashboardStats(
-        total=total,
-        resolved=resolved,
-        pending=pending,
+        total=total, resolved=resolved, pending=pending,
         public_feed=[to_out(c) for c in public_items],
     )
-
 
 # Submit Complaint
 @app.post("/student/complaints", response_model=ComplaintOut)
 def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: Session = Depends(get_db)):
-    # Validate student exists
     stu = db.get(Student, payload.student_id)
     if not stu:
         raise HTTPException(status_code=404, detail="Student not found")
 
-    # Insert directly into SQLite (local file complaints.db)
     comp = Complaint(
         student_id=payload.student_id,
         heading=payload.heading.strip(),
@@ -556,35 +510,31 @@ def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: 
         status="pending",
     )
     db.add(comp)
-    db.commit()        # ensure row is written
-    db.refresh(comp)   # load auto fields like id, created_at
+    db.commit()
+    db.refresh(comp)
+    log.info("[Create] Complaint #%s created (public=%s, anonymous=%s)", comp.id, comp.public, comp.anonymous)
 
-    # Agentic classification (updates the same DB row)
     text = f"{comp.heading}\n\n{comp.description}"
     decision = simple_keyword_classifier(text)
     if decision is None:
         decision = gemini_is_ragging(text)
 
+    log.info("[Create] ragging_decision=%s for complaint #%s", decision, comp.id)
+
     if decision is True:
         comp.is_ragging_related = True
-        comp.forwarded_to_arc = True     # reflect immediate forwarding intent in DB
+        comp.forwarded_to_arc = True
         db.commit()
-        # Send ARC email in background (non-blocking)
+        log.info("[Create] Complaint #%s flagged for ARC (queued email)", comp.id)
         background.add_task(send_ragging_email, comp)
 
     return ComplaintOut(
-        id=comp.id,
-        heading=comp.heading,
-        description=comp.description,
-        anonymous=comp.anonymous,
-        public=comp.public,
-        status=comp.status,
-        created_at=comp.created_at,
-        is_ragging_related=comp.is_ragging_related,
+        id=comp.id, heading=comp.heading, description=comp.description,
+        anonymous=comp.anonymous, public=comp.public, status=comp.status,
+        created_at=comp.created_at, is_ragging_related=comp.is_ragging_related,
     )
 
-
-# Recent/Public complaints endpoint used by the Student UI
+# Recent/Public complaints endpoint
 @app.get("/student/complaints", response_model=List[ComplaintOut])
 def list_complaints(public: bool = Query(False), limit: int = Query(10, ge=1, le=100), db: Session = Depends(get_db)):
     q = select(Complaint)
@@ -592,42 +542,28 @@ def list_complaints(public: bool = Query(False), limit: int = Query(10, ge=1, le
         q = q.where(Complaint.public == True)
     q = q.order_by(Complaint.created_at.desc()).limit(limit)
     items = db.scalars(q).all()
-    # Note: ComplaintOut does not include student_id (keeps identity hidden)
     return [
         ComplaintOut(
-            id=c.id,
-            heading=c.heading,
-            description=c.description,
-            anonymous=c.anonymous if not public else True,  # anonymize feed
-            public=c.public,
-            status=c.status,
-            created_at=c.created_at,
+            id=c.id, heading=c.heading, description=c.description,
+            anonymous=c.anonymous if not public else True,
+            public=c.public, status=c.status, created_at=c.created_at,
             is_ragging_related=c.is_ragging_related,
         ) for c in items
     ]
 
-
-# My Complaints (by student)
+# My Complaints
 @app.get("/student/complaints/{student_id}", response_model=List[ComplaintOut])
 def my_complaints(student_id: int, db: Session = Depends(get_db)):
-    # Ensure student exists
     if not db.get(Student, student_id):
         raise HTTPException(status_code=404, detail="Student not found")
-
     items = db.scalars(select(Complaint).where(Complaint.student_id == student_id).order_by(Complaint.created_at.desc())).all()
     return [
         ComplaintOut(
-            id=c.id,
-            heading=c.heading,
-            description=c.description,
-            anonymous=c.anonymous,
-            public=c.public,
-            status=c.status,
-            created_at=c.created_at,
-            is_ragging_related=c.is_ragging_related,
+            id=c.id, heading=c.heading, description=c.description,
+            anonymous=c.anonymous, public=c.public, status=c.status,
+            created_at=c.created_at, is_ragging_related=c.is_ragging_related,
         ) for c in items
     ]
-
 
 # Admin Dashboard
 @app.get("/admin/dashboard", response_model=DashboardStats)
@@ -641,23 +577,15 @@ def admin_dashboard(db: Session = Depends(get_db)):
 
     def to_out(c: Complaint) -> ComplaintOut:
         return ComplaintOut(
-            id=c.id,
-            heading=c.heading,
-            description=c.description,
-            anonymous=True,  # anonymized on public feed
-            public=c.public,
-            status=c.status,
-            created_at=c.created_at,
-            is_ragging_related=c.is_ragging_related,
+            id=c.id, heading=c.heading, description=c.description,
+            anonymous=True, public=c.public, status=c.status,
+            created_at=c.created_at, is_ragging_related=c.is_ragging_related,
         )
 
     return DashboardStats(
-        total=total,
-        resolved=resolved,
-        pending=pending,
+        total=total, resolved=resolved, pending=pending,
         public_feed=[to_out(c) for c in public_items],
     )
-
 
 # Admin: List All Complaints
 @app.get("/admin/complaints", response_model=List[ComplaintOutWithStudent])
@@ -665,18 +593,11 @@ def list_all_complaints(db: Session = Depends(get_db)):
     items = db.scalars(select(Complaint).order_by(Complaint.created_at.desc())).all()
     return [
         ComplaintOutWithStudent(
-            id=c.id,
-            student_id=c.student_id,
-            heading=c.heading,
-            description=c.description,
-            anonymous=c.anonymous,
-            public=c.public,
-            status=c.status,
-            created_at=c.created_at,
-            is_ragging_related=c.is_ragging_related,
+            id=c.id, student_id=c.student_id, heading=c.heading, description=c.description,
+            anonymous=c.anonymous, public=c.public, status=c.status,
+            created_at=c.created_at, is_ragging_related=c.is_ragging_related,
         ) for c in items
     ]
-
 
 # Admin: Update Complaint Status
 @app.put("/admin/complaints/{complaint_id}", response_model=ComplaintOutWithStudent)
@@ -684,35 +605,25 @@ def update_status(complaint_id: int, payload: StatusUpdate, db: Session = Depend
     comp = db.get(Complaint, complaint_id)
     if not comp:
         raise HTTPException(status_code=404, detail="Complaint not found")
-
-    comp.status = payload.status  # allowed: pending | in_progress | resolved
+    prev = comp.status
+    comp.status = payload.status
     db.commit()
     db.refresh(comp)
-
+    log.info("[Status] #%s: %s -> %s", comp.id, prev, comp.status)
     return ComplaintOutWithStudent(
-        id=comp.id,
-        student_id=comp.student_id,
-        heading=comp.heading,
-        description=comp.description,
-        anonymous=comp.anonymous,
-        public=comp.public,
-        status=comp.status,
-        created_at=comp.created_at,
-        is_ragging_related=comp.is_ragging_related,
+        id=comp.id, student_id=comp.student_id, heading=comp.heading, description=comp.description,
+        anonymous=comp.anonymous, public=comp.public, status=comp.status,
+        created_at=comp.created_at, is_ragging_related=comp.is_ragging_related,
     )
-
 
 # Admin: Generate Report with Gemini
 @app.post("/admin/report", response_model=ReportResponse)
 def generate_report(_: ReportRequest | None = None, db: Session = Depends(get_db)):
-    # Gather a compact snapshot of recent complaints & stats
     total = db.scalar(select(func.count(Complaint.id))) or 0
     resolved = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "resolved")) or 0
     pending = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "pending")) or 0
 
-    recent_items = db.scalars(
-        select(Complaint).order_by(Complaint.created_at.desc()).limit(50)
-    ).all()
+    recent_items = db.scalars(select(Complaint).order_by(Complaint.created_at.desc()).limit(50)).all()
 
     lines = [
         f"Total={total}",
@@ -727,7 +638,6 @@ def generate_report(_: ReportRequest | None = None, db: Session = Depends(get_db
     snapshot = "\n".join(lines)
 
     if not GEMINI_API_KEY:
-        # Fallback: simple text if Gemini not configured
         return ReportResponse(report_text=("Gemini API key missing. Showing raw snapshot.\n\n" + snapshot))
 
     try:
@@ -743,10 +653,64 @@ def generate_report(_: ReportRequest | None = None, db: Session = Depends(get_db
         report = resp.text or "(No content)"
         return ReportResponse(report_text=report.strip())
     except Exception as e:
+        log.error("Gemini error: %s", e)
         return ReportResponse(report_text=f"Gemini error: {e}\n\nRaw snapshot:\n{snapshot}")
 
-
-# Healthcheck (optional)
+# Healthcheck
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+
+# ------------------------------
+# Debug / Self-test endpoints (non-breaking, optional)
+# ------------------------------
+class DebugText(BaseModel):
+    text: str
+
+@app.get("/debug/ping")
+def debug_ping():
+    return {
+        "ok": True,
+        "smtp_host": SMTP_HOST or "(missing)",
+        "smtp_port": SMTP_PORT,
+        "smtp_user_set": bool(SMTP_USER),
+        "from_email": FROM_EMAIL or "(missing)",
+        "to_email": ANTI_RAGGING_EMAIL or "(missing)",
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "outbox_dir": os.path.abspath("outbox"),
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
+
+@app.post("/debug/classify")
+def debug_classify(payload: DebugText):
+    kw = simple_keyword_classifier(payload.text)
+    gm = None if kw is not None else gemini_is_ragging(payload.text)
+    decision = kw if kw is not None else gm
+    return {
+        "keyword_decision": kw,
+        "gemini_decision": gm,
+        "final_decision": decision
+    }
+
+@app.post("/debug/test_email")
+def debug_test_email():
+    # Compose a fake complaint object in-memory
+    fake = Complaint(
+        id=999999,
+        student_id=0,
+        heading="TEST: Ragging alert",
+        description="This is a test email from /debug/test_email endpoint.",
+        anonymous=True,
+        public=False,
+        status="pending",
+        created_at=datetime.utcnow(),
+        is_ragging_related=True,
+        forwarded_to_arc=True,
+    )
+    log.info("[Debug] Sending test ARC email (id=%s)", fake.id)
+    try:
+        send_ragging_email(fake)
+        return {"ok": True, "message": "Test email attempt finished. Check logs and ./outbox/."}
+    except Exception as e:
+        log.error("[Debug] Test email error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
