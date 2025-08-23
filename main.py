@@ -24,7 +24,7 @@ Update allowed origins in the CORS section if your React app runs on a different
 Notes
 -----
 - Dummy credentials are hardcoded below (STUDENT_CREDENTIALS / ADMIN_CREDENTIALS).
-- Status values: 'not started', 'pending', 'done'. New complaints default to 'pending'.
+- Status values: 'pending', 'in_progress', 'resolved'. New complaints default to 'pending'.
 - Public complaints shown on dashboards never include student identity.
 - A lightweight keyword-based ragging classifier runs first, with Gemini API fallback if uncertain.
 - If flagged, an SMTP email is sent to ANTI_RAGGING_EMAIL with complaint details.
@@ -52,7 +52,7 @@ from typing import List, Optional
 
 import google.generativeai as genai
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -118,7 +118,7 @@ class Student(Base):
     email: Mapped[str] = mapped_column(String(200), unique=True)
     password: Mapped[str] = mapped_column(String(128))  # plaintext for demo only
 
-    complaints: Mapped[List[Complaint]] = relationship("Complaint", back_populates="student")
+    complaints: Mapped[List["Complaint"]] = relationship("Complaint", back_populates="student")
 
 
 class Admin(Base):
@@ -144,10 +144,11 @@ class Complaint(Base):
     is_ragging_related: Mapped[bool] = mapped_column(Boolean, default=False)
     forwarded_to_arc: Mapped[bool] = mapped_column(Boolean, default=False)  # ARC = Anti Ragging Cell
 
-    student: Mapped[Student] = relationship("Student", back_populates="complaints")
+    student: Mapped["Student"] = relationship("Student", back_populates="complaints")
 
     __table_args__ = (
-        CheckConstraint("status in ('not started','pending','done')", name="ck_status"),
+        # ✅ Updated to match frontend values
+        CheckConstraint("status in ('pending','in_progress','resolved')", name="ck_status"),
     )
 
 
@@ -184,8 +185,9 @@ class ComplaintOut(BaseModel):
 class ComplaintOutWithStudent(ComplaintOut):
     student_id: int
 
+# ✅ Updated to match frontend values
 class StatusUpdate(BaseModel):
-    status: str = Field(pattern=r"^(not started|pending|done)$")
+    status: str = Field(pattern=r"^(pending|in_progress|resolved)$")
 
 class DashboardStats(BaseModel):
     total: int
@@ -261,7 +263,6 @@ def startup_event():
 # ------------------------------
 # Agentic Classifier & Email
 # ------------------------------
-
 def simple_keyword_classifier(text: str) -> Optional[bool]:
     if not text:
         return None
@@ -362,10 +363,10 @@ def login_admin(payload: LoginRequest, db: Session = Depends(get_db)):
 def student_dashboard(student_id: int, db: Session = Depends(get_db)):
     # Stats for *all* complaints visible to student
     total = db.scalar(select(func.count(Complaint.id))) or 0
-    resolved = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "done")) or 0
+    resolved = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "resolved")) or 0
     pending = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "pending")) or 0
 
-    # Recent public complaints (anonymized). You can add ORDER BY created_at DESC, LIMIT N in your frontend polling logic
+    # Recent public complaints (anonymized)
     public_q = select(Complaint).where(Complaint.public == True).order_by(Complaint.created_at.desc()).limit(10)
     public_items = db.scalars(public_q).all()
 
@@ -433,6 +434,29 @@ def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: 
     )
 
 
+# ✅ Recent/Public complaints endpoint used by the Student UI
+@app.get("/student/complaints", response_model=List[ComplaintOut])
+def list_complaints(public: bool = Query(False), limit: int = Query(10, ge=1, le=100), db: Session = Depends(get_db)):
+    q = select(Complaint)
+    if public:
+        q = q.where(Complaint.public == True)
+    q = q.order_by(Complaint.created_at.desc()).limit(limit)
+    items = db.scalars(q).all()
+    # Note: ComplaintOut does not include student_id (keeps identity hidden)
+    return [
+        ComplaintOut(
+            id=c.id,
+            heading=c.heading,
+            description=c.description,
+            anonymous=c.anonymous if not public else True,  # anonymize feed
+            public=c.public,
+            status=c.status,
+            created_at=c.created_at,
+            is_ragging_related=c.is_ragging_related,
+        ) for c in items
+    ]
+
+
 # My Complaints (by student)
 @app.get("/student/complaints/{student_id}", response_model=List[ComplaintOut])
 def my_complaints(student_id: int, db: Session = Depends(get_db)):
@@ -459,7 +483,7 @@ def my_complaints(student_id: int, db: Session = Depends(get_db)):
 @app.get("/admin/dashboard", response_model=DashboardStats)
 def admin_dashboard(db: Session = Depends(get_db)):
     total = db.scalar(select(func.count(Complaint.id))) or 0
-    resolved = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "done")) or 0
+    resolved = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "resolved")) or 0
     pending = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "pending")) or 0
 
     public_q = select(Complaint).where(Complaint.public == True).order_by(Complaint.created_at.desc()).limit(10)
@@ -470,7 +494,7 @@ def admin_dashboard(db: Session = Depends(get_db)):
             id=c.id,
             heading=c.heading,
             description=c.description,
-            anonymous=True,  # still anonymized on public feed
+            anonymous=True,  # anonymized on public feed
             public=c.public,
             status=c.status,
             created_at=c.created_at,
@@ -511,7 +535,7 @@ def update_status(complaint_id: int, payload: StatusUpdate, db: Session = Depend
     if not comp:
         raise HTTPException(status_code=404, detail="Complaint not found")
 
-    comp.status = payload.status
+    comp.status = payload.status  # allowed: pending | in_progress | resolved
     db.commit()
     db.refresh(comp)
 
@@ -533,7 +557,7 @@ def update_status(complaint_id: int, payload: StatusUpdate, db: Session = Depend
 def generate_report(_: ReportRequest | None = None, db: Session = Depends(get_db)):
     # Gather a compact snapshot of recent complaints & stats
     total = db.scalar(select(func.count(Complaint.id))) or 0
-    resolved = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "done")) or 0
+    resolved = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "resolved")) or 0
     pending = db.scalar(select(func.count(Complaint.id)).where(Complaint.status == "pending")) or 0
 
     recent_items = db.scalars(
@@ -542,7 +566,7 @@ def generate_report(_: ReportRequest | None = None, db: Session = Depends(get_db
 
     lines = [
         f"Total={total}",
-        f"Resolved(done)={resolved}",
+        f"Resolved(resolved)={resolved}",
         f"Pending={pending}",
         "Recent complaints (latest 50):",
     ]
