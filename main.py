@@ -247,6 +247,8 @@ ADMIN_CREDENTIALS = [
 RAGGING_KEYWORDS = {
     "ragging", "hazing", "harass", "harassment", "bully", "bullying",
     "assault", "threat", "extort", "freshers", "seniors forced",
+    "force introduction", "forced introduction", "rag", "ragged",
+    "physical abuse", "verbal abuse", "intimidate", "coerce",
 }
 
 def get_db():
@@ -355,9 +357,15 @@ def startup_event():
 # Agentic Classifier & Email
 # ------------------------------
 def simple_keyword_classifier(text: str) -> Optional[bool]:
+    """
+    Returns:
+      True  -> clearly ragging-related
+      None  -> uncertain
+    """
     if not text:
         return None
     lower = text.lower()
+    # high-confidence: any keyword hit -> True
     if any(kw in lower for kw in RAGGING_KEYWORDS):
         return True
     return None  # uncertain
@@ -385,11 +393,31 @@ def gemini_is_ragging(text: str) -> Optional[bool]:
     return None
 
 
-def send_ragging_email(complaint: Complaint):
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and ANTI_RAGGING_EMAIL and FROM_EMAIL):
-        print("[SMTP] Missing SMTP/.env config; skip sending.")
-        return
+def _ensure_outbox_dir() -> str:
+    out_dir = os.path.join(os.getcwd(), "outbox")
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
 
+
+def _save_eml_copy(filename_base: str, msg: MIMEMultipart) -> None:
+    out_dir = _ensure_outbox_dir()
+    path = os.path.join(out_dir, f"{filename_base}.eml")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(msg.as_string())
+        print(f"[OUTBOX] Saved email copy to {path}")
+    except Exception as e:
+        print("[OUTBOX] Failed to save .eml copy:", e)
+
+
+def send_ragging_email(complaint: Complaint):
+    """
+    Attempts to send an email to the Anti-Ragging Cell with SMTP.
+    - Uses STARTTLS for ports like 587.
+    - Uses SSL for port 465.
+    - Falls back to unauthenticated SMTP if creds missing (for campus relays).
+    - Always writes a copy to ./outbox/*.eml for audit/dev.
+    """
     subject = f"[ARC FLAG] Complaint #{complaint.id}: {complaint.heading}"
     body = (
         f"Complaint ID: {complaint.id}\n"
@@ -400,20 +428,49 @@ def send_ragging_email(complaint: Complaint):
         f"Description:\n{complaint.description}\n"
     )
 
+    to_addr = ANTI_RAGGING_EMAIL or "antiraggingcell@localhost"
+    from_addr = FROM_EMAIL or "noreply@localhost"
+
     msg = MIMEMultipart()
-    msg["From"] = FROM_EMAIL
-    msg["To"] = ANTI_RAGGING_EMAIL
+    msg["From"] = from_addr
+    msg["To"] = to_addr
     msg["Subject"] = subject
+    msg["X-Auto-Generated"] = "Yes"
     msg.attach(MIMEText(body, "plain"))
 
+    # Always save a copy to outbox (so a "mail is written" even if SMTP fails/missing)
+    _save_eml_copy(f"arc-{complaint.id}", msg)
+
+    # If SMTP host not defined, skip network send (already saved .eml)
+    if not SMTP_HOST:
+        print("[SMTP] SMTP_HOST missing; saved .eml only.")
+        return
+
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.send_message(msg)
+        if SMTP_PORT == 465:
+            # SSL direct
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+                server.ehlo()
+                if SMTP_USER and SMTP_PASS:
+                    server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
+        else:
+            # STARTTLS or plain
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+                server.ehlo()
+                try:
+                    server.starttls()
+                    server.ehlo()
+                except Exception:
+                    # Some campus relays may not support STARTTLS; proceed without it
+                    pass
+                if SMTP_USER and SMTP_PASS:
+                    server.login(SMTP_USER, SMTP_PASS)
+                server.send_message(msg)
         print(f"[SMTP] Sent ARC email for complaint {complaint.id}")
     except Exception as e:
         print("[SMTP] Error sending ARC email:", e)
+        # .eml copy already saved; nothing else to do
 
 
 # ------------------------------
