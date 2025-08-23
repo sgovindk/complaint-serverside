@@ -175,7 +175,7 @@ class Complaint(Base):
     student: Mapped["Student"] = relationship("Student", back_populates="complaints")
 
     __table_args__ = (
-        # ✅ Matches frontend values
+        # ✅ Matches frontend values (may not be physically present after migration; enforced at app level too)
         CheckConstraint("status in ('pending','in_progress','resolved')", name="ck_status"),
     )
 
@@ -257,9 +257,73 @@ def get_db():
         db.close()
 
 
+def _needs_status_migration(conn) -> bool:
+    # Check table SQL for old enum words or presence of 'done'/'not started'
+    cur = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='complaints'")
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return False
+    ddl = row[0].lower()
+    return ("not started" in ddl) or ("done" in ddl)
+
+
+def _migrate_complaints_table(conn) -> None:
+    # Recreate complaints table without old CHECK, and normalize existing rows
+    conn.executescript("""
+    PRAGMA foreign_keys=off;
+    BEGIN TRANSACTION;
+
+    CREATE TABLE IF NOT EXISTS complaints_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        student_id INTEGER NOT NULL,
+        heading VARCHAR(200) NOT NULL,
+        description TEXT NOT NULL,
+        anonymous BOOLEAN NOT NULL DEFAULT 0,
+        public BOOLEAN NOT NULL DEFAULT 0,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        is_ragging_related BOOLEAN NOT NULL DEFAULT 0,
+        forwarded_to_arc BOOLEAN NOT NULL DEFAULT 0,
+        FOREIGN KEY(student_id) REFERENCES students(id)
+    );
+
+    INSERT INTO complaints_new (id, student_id, heading, description, anonymous, public, status, created_at, is_ragging_related, forwarded_to_arc)
+    SELECT
+        id,
+        student_id,
+        heading,
+        description,
+        COALESCE(anonymous, 0),
+        COALESCE(public, 0),
+        CASE
+            WHEN LOWER(status) IN ('resolved','done') THEN 'resolved'
+            WHEN LOWER(status) IN ('in_progress','in progress','in-progress') THEN 'in_progress'
+            ELSE 'pending'
+        END AS status,
+        created_at,
+        COALESCE(is_ragging_related, 0),
+        COALESCE(forwarded_to_arc, 0)
+    FROM complaints;
+
+    DROP TABLE complaints;
+    ALTER TABLE complaints_new RENAME TO complaints;
+
+    COMMIT;
+    PRAGMA foreign_keys=on;
+    """)
+
+
 def ensure_seed_data(db: Session) -> None:
     # Create tables
     Base.metadata.create_all(bind=engine)
+
+    # --- Migration: fix legacy status constraint/values if present ---
+    with engine.begin() as conn:
+        try:
+            if _needs_status_migration(conn.connection):
+                _migrate_complaints_table(conn.connection)
+        except Exception as e:
+            print("[Migration] Skipped status migration due to error:", e)
 
     # Seed if empty
     if not db.scalar(select(func.count(Student.id))):
