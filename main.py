@@ -89,7 +89,7 @@ if GEMINI_API_KEY:
 # ------------------------------
 app = FastAPI(title="Agentic Campus Complaint Portal")
 
-# ✅ Explicit CORS (add your deployed frontend origins here too)
+# ✅ Updated CORS configuration to include deployed domain and allow all origins for development
 ALLOWED_ORIGINS = [
     "http://localhost:8080",
     "http://127.0.0.1:8080",
@@ -97,15 +97,17 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
-    # "https://your-frontend.example.com",
+    "https://web-production-89a82.up.railway.app",
+    # Add your deployed frontend domain here
+    "*"  # Allow all origins for development - remove in production
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],  # Allow all origins for development
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+    allow_headers=["*"],  # Allow all headers
     expose_headers=["*"],
     max_age=86400,
 )
@@ -113,7 +115,15 @@ app.add_middleware(
 # ✅ Catch-all OPTIONS so proxies don't 405 the preflight
 @app.options("/{rest_of_path:path}")
 def cors_preflight(rest_of_path: str):
-    return Response(status_code=204)
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400"
+        }
+    )
 
 Base = declarative_base()
 
