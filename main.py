@@ -262,7 +262,7 @@ def ensure_seed_data(db: Session) -> None:
     if not db.scalar(select(func.count(Complaint.id))):
         # Some dummy complaints
         samples = [
-            Complaint(student_id=1, heading="Water leakage in hostel", description="Bathroom on 2nd floor leaks.", anonymous=False, public=True, status="pending"),
+            Complaint(student_id=1, heading="Water leakage in hostel", description="Bathroom on 2nd floor leaks.", anonymous=False, public=True, status="resolved"),
             Complaint(student_id=2, heading="WiFi not working", description="Library WiFi down since yesterday.", anonymous=False, public=True, status="pending"),
             Complaint(student_id=1, heading="Seniors forcing introductions", description="Freshers asked to give intro loudly.", anonymous=True, public=False, status="pending"),
         ]
