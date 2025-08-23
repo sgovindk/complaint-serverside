@@ -52,7 +52,7 @@ from typing import List, Optional
 
 import google.generativeai as genai
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import (
@@ -89,20 +89,31 @@ if GEMINI_API_KEY:
 # ------------------------------
 app = FastAPI(title="Agentic Campus Complaint Portal")
 
-# Allow local dev React origins; add yours as needed
+# ✅ Explicit CORS (add your deployed frontend origins here too)
+ALLOWED_ORIGINS = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    # "https://your-frontend.example.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-        "*",  # relax for dev; tighten for prod
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+    expose_headers=["*"],
+    max_age=86400,
 )
+
+# ✅ Catch-all OPTIONS so proxies don't 405 the preflight
+@app.options("/{rest_of_path:path}")
+def cors_preflight(rest_of_path: str):
+    return Response(status_code=204)
 
 Base = declarative_base()
 
@@ -404,7 +415,7 @@ def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: 
     if not stu:
         raise HTTPException(status_code=404, detail="Student not found")
 
-    # ✅ Insert directly into SQLite (local file complaints.db)
+    # Insert directly into SQLite (local file complaints.db)
     comp = Complaint(
         student_id=payload.student_id,
         heading=payload.heading.strip(),
@@ -425,7 +436,7 @@ def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: 
 
     if decision is True:
         comp.is_ragging_related = True
-        comp.forwarded_to_arc = True     # ✅ reflect immediate forwarding intent in DB
+        comp.forwarded_to_arc = True     # reflect immediate forwarding intent in DB
         db.commit()
         # Send ARC email in background (non-blocking)
         background.add_task(send_ragging_email, comp)
@@ -442,7 +453,7 @@ def create_complaint(payload: ComplaintCreate, background: BackgroundTasks, db: 
     )
 
 
-# ✅ Recent/Public complaints endpoint used by the Student UI
+# Recent/Public complaints endpoint used by the Student UI
 @app.get("/student/complaints", response_model=List[ComplaintOut])
 def list_complaints(public: bool = Query(False), limit: int = Query(10, ge=1, le=100), db: Session = Depends(get_db)):
     q = select(Complaint)
