@@ -230,8 +230,8 @@ class ReportResponse(BaseModel):
 # Dummy Credentials (Hardcoded for Demo)
 # ------------------------------
 STUDENT_CREDENTIALS = [
-    {"id": 1, "name": "Alice Kumar", "email": "alice@univ.edu", "password": "alice123"},
-    {"id": 2, "name": "Bala Singh", "email": "bala@univ.edu", "password": "bala123"},
+    {"id": 1, "name": "Alice", "email": "alice@univ.edu", "password": "alice123"},
+    {"id": 2, "name": "Mukundan", "email": "mukundan@univ.edu", "password": "mukundan123"},
 ]
 
 ADMIN_CREDENTIALS = [
